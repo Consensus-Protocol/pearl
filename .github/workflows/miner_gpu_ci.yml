@@ -95,7 +95,7 @@ jobs:
     needs: [detect-changes, start-runner]
     if: always() && !cancelled() && needs.detect-changes.outputs.should_run == 'true'
     runs-on: ${{ needs.start-runner.outputs.label || 'b200-gpu' }}
-    timeout-minutes: 120
+    timeout-minutes: 180
     container:
       image: public.ecr.aws/x5p2d7p8/pearl/ci-container:latest
       options: --gpus all --shm-size=16g --ipc=host
@@ -163,6 +163,8 @@ jobs:
       run: task build:pearld
 
     - name: Run end-to-end regtest mining test
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
       run: uv run pytest -v -s -m integration miner/vllm-miner/tests/test_e2e_regtest.py
 
   stop-runner:
