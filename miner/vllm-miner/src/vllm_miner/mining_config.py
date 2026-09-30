@@ -111,7 +111,8 @@ def max_verifiable_k(tile_cols: int = TILE_COLS, tile_rows: int = TILE_ROWS) -> 
     """Largest ``k`` whose peel proof fits the verifier's worker input for a
     committed ``tile_rows x tile_cols`` lottery tile."""
     elements_per_k = tile_rows + tile_cols
-    return (_VERIFIER_MAX_OPENED_STRIPS // elements_per_k) // _K_ALIGNMENT * _K_ALIGNMENT
+    k_from_strips = (_VERIFIER_MAX_OPENED_STRIPS // elements_per_k) // _K_ALIGNMENT * _K_ALIGNMENT
+    return min(k_from_strips, _VERIFIER_MAX_K)
 
 
 def _tile_max_k(tile: LotteryTileSpec) -> int:
