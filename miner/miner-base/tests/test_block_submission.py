@@ -38,7 +38,7 @@ from pearl_mining import (
 
 _M = 256
 _N = 256
-_K = 2048  # cert-v4 verifier floor
+_K = 2048  # cert-v4 verifier accepts k >= 1024; 2048 is a common test size
 # Hard default; the maximum compact target makes every lottery tile win.
 DEFAULT_NBITS = 0x173FFFFF
 ALWAYS_WIN_NBITS = 0x207FFFFF

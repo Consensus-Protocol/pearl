@@ -70,8 +70,8 @@ def tall_tile_config(k: int, r: int = R, device: Device = Device.BLACKWELL) -> M
     """16x32 merged tile (mixed_gemm's ltile_rows=16, ltile_cols=32 variant).
 
     Same 512-element area as 4x128 (difficulty-invariant) but rows+cols = 48,
-    so the peel proof fits the verifier's 4 MiB worker input up to k ~ 43520
-    (vs 15872 for 4x128) -- what makes k=16384 (GLM o_proj) mineable. Grid is
+    so the peel proof fits the verifier's 2^22 element limit up to k = 65536
+    (vs 31744 for 4x128) -- what makes k=16384 (GLM o_proj) mineable. Grid is
     16x1 with a 1x32 subtile: one lane per tile row, each lane folding its
     row's 32 contiguous columns in ascending order -- exactly the kernel's
     thread-local single-row fold. Verifier bounds: blake product = 16*1 =

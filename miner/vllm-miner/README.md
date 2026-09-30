@@ -37,7 +37,7 @@ Capability gates:
   (`Device.HOPPER` on SM90, `Device.BLACKWELL` on SM100 and SM120). Hopper
   commits only the 4-row lottery tiles (4x64, 4x128) and SM120 has no kernel
   for the tall 16x32 tile, so on both, layers only that tile can mine (`n` not
-  a multiple of 64, or `k > 30720`) keep their original BF16 path. TP, DP,
+  a multiple of 64, or `k > 61440`) keep their original BF16 path. TP, DP,
   and EP workers independently commit and mine each eligible process-local
   dense shard; there is no cross-rank weight reconstruction or proof
   aggregation.
