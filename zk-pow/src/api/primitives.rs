@@ -21,7 +21,7 @@ impl<T> Sides<T> {
 
 /// The block header that is set by the verifier and for which the proof should apply.
 /// Serialized by miner/node field by field in little endian and with hash bytes reversed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(C)]
 #[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "IncompleteBlockHeader", get_all, set_all))]
 pub struct IncompleteBlockHeader {
@@ -30,4 +30,14 @@ pub struct IncompleteBlockHeader {
     pub merkle_root: Hash256, // of transactions
     pub timestamp: u32,       // Unix timestamp. Seconds since epoch.
     pub nbits: u32,           // Difficulty target (U256) encoded as u32
+}
+
+/// A complete block header: the [`IncompleteBlockHeader`] fields followed by the
+/// proof commitment, serialized as the node's 108-byte wire header.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "pyo3", pyo3::pyclass(name = "BlockHeader", get_all))]
+pub struct BlockHeader {
+    pub incomplete: IncompleteBlockHeader,
+    /// Raw wire bytes (reversed hash bytes, unlike `prev_block` / `merkle_root`).
+    pub proof_commitment: Hash256,
 }

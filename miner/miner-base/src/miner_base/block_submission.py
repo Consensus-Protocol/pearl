@@ -3,11 +3,13 @@
 GPU and framework adapters extract the committed planes for a winning tile;
 this module validates that opening, builds and verifies the consensus
 ``PlainProofV4``, and submits admissible candidates through the miner RPC
-client. The proof opens A's trees under ``keyA`` and B's under ``keyB``, both
-derived from the proposed header (the miner proposes at depth 0, so the
-ancestor header that keyed B is the proposed header itself).
+client. The proof opens A's trees under ``keyA``, derived from the proposed
+header, and B's under ``keyB``, derived from a complete ancestor header in
+the four-header state window. The proof carries the intermediate headers
+that connect the proposed header to that ancestor, parent first.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -120,6 +122,7 @@ class OpenedBlockInfo:
     b_commitment: PrebuiltCommitment | None = None
     a_commitment: PrebuiltCommitment | None = None
     moe: MoEBlockInfo | None = None
+    b_ancestor_header: bytes | None = None  # Full 108-byte header; None selects the parent.
 
     def owned_copy(self) -> "OpenedBlockInfo":
         """Validate and snapshot mutable inputs for an asynchronous handoff."""
@@ -143,6 +146,9 @@ class OpenedBlockInfo:
             mining_config=replace(self.mining_config),
             b_commitment=prebuilt_b,
             a_commitment=prebuilt_a,
+            b_ancestor_header=None
+            if self.b_ancestor_header is None
+            else bytes(self.b_ancestor_header),
         )
 
 
@@ -392,17 +398,22 @@ def _native_operand(params: OperandParams) -> pearl_mining.OperandParams:
 
 
 def create_proof(
-    opened_block_info: OpenedBlockInfo, header: BlockHeader | IncompleteBlockHeader
+    opened_block_info: OpenedBlockInfo,
+    header: BlockHeader | IncompleteBlockHeader,
+    ancestor_header: bytes,
+    ancestor_chain: Sequence[bytes] = (),
 ) -> PlainProofV4:
     """Build a certificate-v4 FP8 ``PlainProofV4`` from a validated winning opening.
 
-    ``header`` is the proposed (incomplete) block header; it keys both sides'
-    trees since the miner proposes at ancestor depth 0.
+    ``header`` is the proposed (incomplete) block header, which keys A's trees;
+    ``ancestor_header`` is the complete 108-byte header that keys B's trees.
+    ``ancestor_chain`` contains the intermediate headers, parent first, and
+    is empty when B is keyed by the parent.
     """
     m, n, k = _validate_opening(opened_block_info)
     config = opened_block_info.mining_config
     header_bytes = bytes(header.to_bytes())
-    key_a, key_b = commitment_keys(header_bytes)
+    key_a, key_b = commitment_keys(header_bytes, ancestor_header)
     a_planes = (opened_block_info.a_codes, opened_block_info.a_scales)
     if opened_block_info.a_commitment is None:
         comm_a = commit_planes(list(a_planes), key_a, config.a_hash_id)
@@ -425,7 +436,7 @@ def create_proof(
 
     common = config.common_params()
     return PlainProofV4(
-        ancestor_header=IncompleteBlockHeader.from_bytes(header_bytes),
+        ancestor_header=pearl_mining.BlockHeader.from_bytes(ancestor_header),
         common=pearl_mining.CommonParams(
             common.k,
             common.r,
@@ -440,6 +451,7 @@ def create_proof(
         scales_b=_native_matrix_proof(bt_scales),
         moe=moe,
         moe_witness=moe_witness,
+        ancestor_chain=[pearl_mining.BlockHeader.from_bytes(h) for h in ancestor_chain],
     )
 
 
@@ -462,7 +474,12 @@ def submit_opened_block(
         )
 
     header = IncompleteBlockHeader.from_bytes(mining_job.incomplete_header_bytes)
-    plain_proof = create_proof(opened_block_info, header)
+    ancestor = opened_block_info.b_ancestor_header
+    if ancestor is None:
+        ancestor = mining_job.parent_header
+    plain_proof = create_proof(
+        opened_block_info, header, ancestor, mining_job.ancestor_chain_to(ancestor)
+    )
     is_valid, message = verify_plain_proof_for_cert_version(
         mining_job.cert_version, header, plain_proof
     )

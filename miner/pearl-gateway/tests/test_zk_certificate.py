@@ -1,4 +1,5 @@
 import struct
+from dataclasses import replace
 from hashlib import sha256
 
 import pytest
@@ -9,11 +10,16 @@ from pearl_gateway.blockchain_utils.zk_certificate import (
     CertificateVersion,
     ZKCertificate,
 )
+from pearl_gateway.proof_generator import ProofGenerator
 from pearl_mining import MIN_MOE_PUBLICDATA_SIZE, PUBLICDATA_SIZE
 
 HEADER_HASH = bytes(range(32))
 PROOF_DATA = bytes([0x5A] * 128)
-ANCESTOR_BYTES = (bytes(range(108)), bytes(range(108, 216)))
+ANCESTOR_BYTES = (
+    bytes(range(108)),
+    bytes(range(108, 216)),
+    bytes(range(216, 256)) + bytes(range(68)),
+)
 ZK_MAX_BLOB_SIZE = 60000
 
 
@@ -65,7 +71,7 @@ def test_serialize_round_trip(cert_version):
     assert certificate.get_proof_commitment() == sha256(sha256(committed).digest()).digest()
 
 
-@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("count", [1, 2, 3])
 def test_v4_serializes_complete_ancestors_in_order(count):
     public_data = b"public data"
     raw_headers = ANCESTOR_BYTES[:count]
@@ -86,7 +92,7 @@ def test_v4_serializes_complete_ancestors_in_order(count):
 
 
 def test_v4_rejects_truncated_certificate():
-    wire = _v4_wire(b"public", PROOF_DATA, b"\x02" + b"".join(ANCESTOR_BYTES))
+    wire = _v4_wire(b"public", PROOF_DATA, b"\x03" + b"".join(ANCESTOR_BYTES))
     for end in range(len(wire)):
         with pytest.raises((ValueError, struct.error)):
             ZKCertificate.deserialize(wire[:end])
@@ -95,7 +101,7 @@ def test_v4_rejects_truncated_certificate():
 @pytest.mark.parametrize(
     "suffix",
     [
-        b"\x03" + ANCESTOR_BYTES[0] * 3,
+        b"\x04" + ANCESTOR_BYTES[0] * 4,
         b"\xfd\x00\x00",
         b"\xfd\x01\x00" + ANCESTOR_BYTES[0],
         b"\xfe\x02\x00\x00\x00" + b"".join(ANCESTOR_BYTES),
@@ -140,7 +146,7 @@ def test_ancestor_count_limit_for_each_version(cert_version):
     )
     header = PearlHeader.deserialize(ANCESTOR_BYTES[0])
     certificate.ancestor_headers = [header] * (
-        3 if cert_version == CertificateVersion.PLAIN_FP8 else 1
+        4 if cert_version == CertificateVersion.PLAIN_FP8 else 1
     )
     with pytest.raises(ValueError):
         certificate.serialize()
@@ -161,7 +167,7 @@ def test_v4_requires_complete_ancestor_headers(commitment):
         )
 
 
-@pytest.mark.parametrize("count", [0, 2])
+@pytest.mark.parametrize("count", [0, 3])
 def test_v4_block_framing(count):
     raw_headers = ANCESTOR_BYTES[:count]
     header = PearlHeader(PearlHeader.deserialize(ANCESTOR_BYTES[0]).incomplete_header)
@@ -181,6 +187,15 @@ def test_v4_block_framing(count):
         public_data, PROOF_DATA, bytes([count]) + b"".join(raw_headers), expected_hash
     )
     assert block.serialize() == expected_certificate + expected_header + b"\x02coinbasetransaction"
+
+
+def test_build_block_certifies_the_supplied_ancestor_chain(sample_block_template):
+    template = replace(sample_block_template, required_cert_version=CertificateVersion.PLAIN_FP8)
+    block = ProofGenerator.build_block(b"public", PROOF_DATA, template, ANCESTOR_BYTES[1:])
+    restored = ZKCertificate.deserialize(block.zk_certificate.serialize())
+    assert [header.serialize() for header in restored.ancestor_headers] == list(ANCESTOR_BYTES[1:])
+    block = ProofGenerator.build_block(b"public", PROOF_DATA, template)
+    assert block.zk_certificate.ancestor_headers == []
 
 
 @pytest.mark.parametrize("cert_version", list(CertificateVersion))

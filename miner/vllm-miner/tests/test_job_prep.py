@@ -1,14 +1,15 @@
 """Per-job B preparation of a mined layer (``vllm_miner.job_prep``).
 
-What a job change costs must depend on *what* changed: a target-only change
-rewrites the 32-byte threshold in place and reuses every B-side artifact, a
-header change reruns the GPU B chain, and an unchanged job does nothing.
+Target and proposed-header changes refresh the threshold and key A, retaining
+B while its ancestor remains in the four-header window. Expiry or a reorg
+reruns B preparation; an unchanged job does nothing.
 
 Host logic only. The expensive GPU B-preparation collaborator is stubbed and
 counted.
 """
 
 import itertools
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -22,7 +23,6 @@ from vllm_miner import settings as settings_module
 from vllm_miner.job_prep import (
     current_context,
     current_job,
-    layer_job_keys,
     prepare_layer,
     prepare_mining,
     unpublish_contexts,
@@ -30,6 +30,7 @@ from vllm_miner.job_prep import (
 from vllm_miner.mining_config import (
     PACKED_NOISE_K,
     RANK,
+    commitment_keys_for,
     mining_configuration,
     threshold_bytes_for,
 )
@@ -49,6 +50,8 @@ _TALL_K = 65536
 _DEVICES = pytest.mark.parametrize("device", list(Device), ids=lambda d: d.name.lower())
 _HEADER = bytes(range(80))
 _OTHER_HEADER = bytes(range(1, 81))
+_PARENT = bytes(range(108))
+_OTHER_PARENT = bytes(range(1, 109))
 _LAYER_IDS = itertools.count(1)
 
 _ALIASED_OPERANDS = (
@@ -66,11 +69,12 @@ _ALIASED_OPERANDS = (
 )
 
 
-def _job(target: int = 100, header: bytes = _HEADER) -> MiningJob:
+def _job(target: int = 100, header: bytes = _HEADER, parent: bytes = _PARENT) -> MiningJob:
     return MiningJob(
         incomplete_header_bytes=header,
         target=target,
         cert_version=CertificateVersion.PLAIN_FP8,
+        ancestor_headers=[parent],
     )
 
 
@@ -119,6 +123,12 @@ def _layer_state(k: int = _K) -> LayerState:
         w_fp8=torch.zeros(_N, k, dtype=torch.float8_e4m3fn),
         w_fp8_scale=torch.ones(1, _N, dtype=torch.float32),
     )
+
+
+@pytest.fixture(autouse=True)
+def async_manager():
+    """Preparation decisions use host buffers without starting the serving runtime."""
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -183,12 +193,13 @@ def test_first_job_runs_the_b_chain_and_publishes_in_place(layer, preps, device)
     ctx = current_context(layer, job)
 
     assert ctx is not None and layer.job_ctx is ctx
-    assert [key for _, key in preps] == [layer_job_keys(job)[1]]
+    assert [key for _, key in preps] == [commitment_keys_for(job)[1]]
     assert ctx.job is job and ctx.target == job.target
     assert ctx.config == mining_configuration(_K, _N, device=device)
     assert ctx.config.device is device
     assert ctx.seed_b == noise_seed_b(b"\x00" * 32, ctx.key_b, ctx.config.p_b(_N))
     assert ctx.b_proof.commit_leaf == layer.buffers.commit_config.chunk_size
+    assert ctx.b_proof.ancestor_header == job.parent_header
     # Every device operand is the steady buffer itself: launches read the
     # same addresses forever.
     for name in _ALIASED_OPERANDS:
@@ -198,23 +209,20 @@ def test_first_job_runs_the_b_chain_and_publishes_in_place(layer, preps, device)
 
 
 @_DEVICES
-def test_same_header_target_change_rewrites_only_the_threshold(layer, preps, device):
-    """The 32 bytes that changed must not cost a full-model B prep.
-
-    Only the lottery threshold depends on the target: keyA/keyB come from the
-    header, seedB from keyB, the commitment and pB, and every B operand from
-    seedB. A target-only change therefore rewrites the threshold in place
-    (stream-ordered with the launches that read it) and republishes.
-    """
+@pytest.mark.parametrize("header", [_HEADER, _OTHER_HEADER], ids=["target", "header_and_target"])
+def test_same_parent_reuses_b_and_refreshes_the_context(layer, preps, device, header):
+    """Refresh key A and the threshold on the serving stream while retaining B."""
     first_job = _job(target=100)
     first = current_context(layer, first_job)
-    second_job = _job(target=200)
+    second_job = _job(target=200, header=header)
     published = current_context(layer, second_job)
 
-    assert len(preps) == 1, "a target-only change reran the B chain"
+    assert len(preps) == 1, "a job with the same parent reran the B chain"
     assert published is not first and layer.job_ctx is published
     assert published.job is second_job and published.target == 200
-    assert (published.key_a, published.key_b) == (first.key_a, first.key_b)
+    assert (published.key_a, published.key_b) == commitment_keys_for(second_job)
+    assert bytes(layer.buffers.key_a_dev.numpy()) == published.key_a
+    assert published.key_b == first.key_b
     assert published.seed_b == first.seed_b
     assert published.b_proof is first.b_proof
     for name in _ALIASED_OPERANDS:
@@ -242,9 +250,36 @@ def test_tall_shape_target_change_reuses_the_b_side(preps, device):
     )
 
 
-def test_header_change_reruns_the_b_chain(layer, preps, device):
+@_DEVICES
+def test_ancestor_window_reuses_b_until_it_expires(layer, preps, device):
     first = current_context(layer, _job())
-    published = current_context(layer, _job(header=_OTHER_HEADER))
+    ancestors = [_PARENT]
+    for depth in range(2, 6):
+        ancestors.insert(0, bytes([depth]) * 108)
+        job = replace(
+            _job(target=100 + depth, header=bytes([depth]) * 76),
+            ancestor_headers=ancestors[:4],
+        )
+        published = current_context(layer, job)
+        assert published.job is job
+        assert bytes(layer.buffers.key_a_dev.numpy()) == published.key_a
+        assert _threshold_words(layer) == threshold_bytes_for(job, _K, _N, device=device)
+        if depth <= 4:
+            assert len(preps) == 1
+            assert published.b_proof is first.b_proof
+            assert published.seed_b == first.seed_b
+            assert (published.key_a, published.key_b) == commitment_keys_for(job, _PARENT)
+        else:
+            assert len(preps) == 2
+            assert published.b_proof.ancestor_header == job.parent_header
+            assert published.seed_b != first.seed_b
+            assert (published.key_a, published.key_b) == commitment_keys_for(job)
+
+
+def test_reorg_away_from_the_ancestor_reruns_the_b_chain(layer, preps, device):
+    first = current_context(layer, _job())
+    # The replacement branch's window excludes the ancestor that keyed B.
+    published = current_context(layer, _job(header=_OTHER_HEADER, parent=_OTHER_PARENT))
 
     assert len(preps) == 2
     assert (published.key_a, published.key_b) != (first.key_a, first.key_b)
