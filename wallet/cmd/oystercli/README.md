@@ -27,13 +27,19 @@ for its exact location — point them at the built `oyster`, or pass
 - **Overview** — per-account balances, pending funds, recent activity.
 - **Send** — guided flow with address/amount validation, a review step, and
   automatic unlock prompting; the fee rate defaults to the network's minimum
-  relay fee (0.00001 PRL/kB).
+  relay fee (0.00001 PRL/kB). When no peer accepts the transaction it says
+  nothing was sent and offers to retry the same send.
 - **Receive** — fresh or current addresses, rendered with a scannable QR code.
-- **Transactions** — paged history browser with filtering and full detail view.
-  A pending send's detail view offers **Rebroadcast** and **Remove** (see
-  below).
+- **Transactions** — paged history browser, newest first, with page filtering
+  and a full detail view. Pages are sized to the terminal, so the **Older** and
+  **Newer** rows always sit right under the list; `/` filters the current page.
+  A transaction with more entries than a page has rows lists what fits and ends
+  with a row that opens its detail view. A pending send's detail view offers
+  **Rebroadcast** and **Remove** (see below).
 - **Accounts** — list, create, rename, and inspect addresses.
-- **Coins** — UTXO listing plus lock/unlock coin control.
+- **Coins** — UTXO listing plus lock/unlock coin control. A wallet with more
+  than 500 outputs is searched first (address, txid, amount, or `locked`) and
+  lists what matches, since the list redraws every row on each key press.
 - **Security** — lock/unlock, passphrase change, WIF import/export (guarded),
   message signing and verification.
 - **Node & sync** — oyster and pearld state at a glance, including the SPV

@@ -32,7 +32,7 @@ MOE_LOTTERY_N = 128
 _MAX_256 = (1 << 256) - 1
 
 # Verifier bounds for a peel proof (pinned py-pearl-mining, zk-pow
-# api/fp8/public_params.rs). A winning tile exposes TILE_ROWS + TILE_COLS rows
+# v4/api/public_params.rs). A winning tile exposes TILE_ROWS + TILE_COLS rows
 # of k BF16 elements to one verifier worker, capped at 2^22 elements; cert-v4
 # rejects k below 1024 (and above 2^16) outright. Work outside this domain can
 # never become an accepted proof, so it must never be credited.
@@ -229,14 +229,18 @@ def _cached_mining_configuration(
     )
 
 
-def commitment_keys_for(job: MiningJob) -> tuple[bytes, bytes]:
-    """``(keyA, keyB)``: the header's per-side Merkle opening keys.
+def commitment_keys_for(
+    job: MiningJob, ancestor_header: bytes | None = None
+) -> tuple[bytes, bytes]:
+    """``(keyA, keyB)``: the job's per-side Merkle opening keys.
 
-    v4 keys the trees by the proposed header alone (``H_"key-A"(header)``,
-    ``H_"key-B"(header)`` at ancestor depth 0), so every layer of a job shares
-    one pair; the layer shape and committed tile enter the chain later, through
-    ``pA``/``pB`` in the noise seeds (``miner_base.commitment_hash``)."""
-    return commitment_keys(bytes(job.incomplete_header_bytes))
+    v4 keys A's trees by the proposed header (``H_"key-A"(header)``) and B's by
+    a complete ancestor header (``H_"key-B"(ancestor)``; None selects the parent).
+    The layer shape and committed tile enter the chain through ``pA``/``pB`` in the noise seeds
+    (``miner_base.commitment_hash``)."""
+    if ancestor_header is None:
+        ancestor_header = job.parent_header
+    return commitment_keys(bytes(job.incomplete_header_bytes), bytes(ancestor_header))
 
 
 def _tile_work(tile: LotteryTileSpec, k: int) -> int:

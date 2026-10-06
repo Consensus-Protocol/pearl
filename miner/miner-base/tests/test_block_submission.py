@@ -1,4 +1,9 @@
+import ctypes
+import subprocess
+import sys
 from dataclasses import replace
+from functools import partial
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -29,7 +34,9 @@ from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_gateway.config import MinerRpcConfig
 from pearl_mining import (
     CERT_VERSION_PLAIN_FP8,
+    BlockHeader,
     IncompleteBlockHeader,
+    PlainProofV4,
     verify_plain_proof_for_cert_version,
 )
 from pearl_mining import (
@@ -44,13 +51,26 @@ DEFAULT_NBITS = 0x173FFFFF
 ALWAYS_WIN_NBITS = 0x207FFFFF
 
 
-def make_plain_peel_header(
-    nbits: int = DEFAULT_NBITS, timestamp: int = 1_700_000_000
-) -> IncompleteBlockHeader:
-    """A static block-template header (no chain to extend)."""
-    return IncompleteBlockHeader(
+PARENT = BlockHeader(
+    IncompleteBlockHeader(
         version=1,
         prev_block=b"\x11" * 32,
+        merkle_root=b"\x33" * 32,
+        timestamp=1_699_999_000,
+        nbits=DEFAULT_NBITS,
+    ),
+    b"\x44" * 32,
+)
+PARENT_BYTES = bytes(PARENT.to_bytes())
+
+
+def make_plain_peel_header(
+    nbits: int = DEFAULT_NBITS, timestamp: int = 1_700_000_000, parent: BlockHeader = PARENT
+) -> IncompleteBlockHeader:
+    """A block-template header extending ``parent``."""
+    return IncompleteBlockHeader(
+        version=1,
+        prev_block=bytes(parent.block_hash()),
         merkle_root=b"\x22" * 32,
         timestamp=timestamp,
         nbits=nbits,
@@ -121,11 +141,13 @@ def test_commit_planes_for_leaf_forwards_the_leaf():
 def test_plain_peel_proof_verifies_and_binds_header(tile):
     header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS)
     config = _TILE_CONFIGS[tile]()
-    proof = create_proof(_opening(config=config), header)
+    proof = create_proof(_opening(config=config), header, PARENT_BYTES)
 
     assert proof.min_cert_version == CERT_VERSION_PLAIN_FP8
     assert proof.a.hash_id == config.a_hash_id.value
     assert proof.b.hash_id == config.b_hash_id.value
+    assert bytes(proof.ancestor_header.to_bytes()) == PARENT_BYTES
+    assert proof.ancestor_chain == []
     accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, header, proof)
     assert accepted, message
 
@@ -133,12 +155,138 @@ def test_plain_peel_proof_verifies_and_binds_header(tile):
     accepted, _ = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, other_header, proof)
     assert not accepted
 
+    # The parent must be the proposed header's: a header on another chain is rejected.
+    orphan = IncompleteBlockHeader(
+        version=header.version,
+        prev_block=b"\x55" * 32,
+        merkle_root=header.merkle_root,
+        timestamp=header.timestamp,
+        nbits=header.nbits,
+    )
+    accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, orphan, proof)
+    assert not accepted
+    assert "does not connect" in message
+
 
 def test_plain_peel_proof_maps_hopper_to_native_h100():
     config = default_mining_config(k=_K, rank=32, device=Device.HOPPER)
-    proof = create_proof(_opening(config=config), make_plain_peel_header())
+    proof = create_proof(_opening(config=config), make_plain_peel_header(), PARENT_BYTES)
 
     assert proof.common.device == NativeDevice.H100
+
+
+def _historical_plain_proof(depth: int):
+    lineage = [PARENT]
+    for _ in range(1, depth):
+        parent = lineage[-1]
+        lineage.append(
+            BlockHeader(
+                make_plain_peel_header(ALWAYS_WIN_NBITS, parent.incomplete.timestamp + 1, parent),
+                b"\x44" * 32,
+            )
+        )
+    parent = lineage[-1]
+    header = make_plain_peel_header(ALWAYS_WIN_NBITS, parent.incomplete.timestamp + 1, parent)
+    return header, create_proof(
+        _opening(), header, PARENT_BYTES, [bytes(h.to_bytes()) for h in reversed(lineage[1:])]
+    )
+
+
+def _with_ancestry(proof, ancestor, chain):
+    return PlainProofV4(
+        ancestor_header=ancestor,
+        common=proof.common,
+        a=proof.a,
+        b=proof.b,
+        values_a=proof.values_a,
+        values_b=proof.values_b,
+        scales_a=proof.scales_a,
+        scales_b=proof.scales_b,
+        ancestor_chain=chain,
+    )
+
+
+@pytest.fixture(scope="module", params=["python", "c"])
+def plain_v4_verifier(request, tmp_path_factory):
+    if request.param == "python":
+        return partial(verify_plain_proof_for_cert_version, CERT_VERSION_PLAIN_FP8)
+    # Link the existing Go static library so both interfaces use the same proof cases.
+    static = (
+        Path(__file__).resolve().parents[3] / "zk-pow/bindings/go/target/release/libzk_pow_ffi.a"
+    )
+    if sys.platform != "linux" or not static.exists():
+        pytest.skip("C verifier tests require Linux and task build:zk-gobind")
+    shared = tmp_path_factory.mktemp("plain-ffi") / "verify.so"
+    subprocess.run(
+        ["cc", "-shared", "-Wl,-u,verify_plain_proof_v4_ffi", str(static)]
+        + ["-ldl", "-lpthread", "-lm", "-o", str(shared)],
+        check=True,
+    )
+    verify = ctypes.CDLL(str(shared)).verify_plain_proof_v4_ffi
+    verify.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+    ]
+
+    def verify_proof(header, proof):
+        error = ctypes.create_string_buffer(128)
+        wire = bytes(proof.to_bytes())
+        code = verify(bytes(header.to_bytes()), wire, len(wire), 0, error)
+        assert code != 2, error.value
+        return code == 0, error.value.decode()
+
+    return verify_proof
+
+
+@pytest.mark.parametrize("depth", range(1, 5))
+def test_plain_fp8_accepts_all_ancestor_depths(depth, plain_v4_verifier):
+    header, proof = _historical_plain_proof(depth)
+    restored = PlainProofV4.from_bytes(proof.to_bytes())
+    accepted, message = plain_v4_verifier(header, restored)
+    assert accepted, message
+
+
+@pytest.fixture(scope="module")
+def historical_plain_proof():
+    return _historical_plain_proof(4)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "too_deep",
+        "proposed_as_ancestor",
+        "intermediate_commitment",
+        "ancestor_commitment",
+    ],
+)
+def test_plain_fp8_rejects_invalid_ancestry(historical_plain_proof, mutation, plain_v4_verifier):
+    header, proof = historical_plain_proof
+    ancestor, chain = proof.ancestor_header, proof.ancestor_chain
+    if mutation == "missing":
+        chain = []
+    elif mutation == "too_deep":
+        chain.append(ancestor)
+    elif mutation == "proposed_as_ancestor":
+        ancestor, chain = BlockHeader(header, bytes(32)), []
+    else:
+        wire = bytearray(
+            (chain[0] if mutation == "intermediate_commitment" else ancestor).to_bytes()
+        )
+        wire[76] ^= 1
+        tampered = BlockHeader.from_bytes(wire)
+        if mutation == "intermediate_commitment":
+            chain[0] = tampered
+        else:
+            ancestor = tampered
+    invalid = _with_ancestry(proof, ancestor, chain)
+    accepted, message = plain_v4_verifier(header, invalid)
+    assert not accepted
+    assert "does not connect" in message or "state window" in message
 
 
 def test_tall_tile_keeps_high_k_proof_under_the_verifier_cap():
@@ -210,7 +358,7 @@ def test_moe_plain_peel_proof_verifies(per_expert, w, tile):
         moe=moe,
     )
     header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS)
-    proof = create_proof(opening, header)
+    proof = create_proof(opening, header, PARENT_BYTES)
 
     assert proof.moe is not None and proof.moe.experts == experts
     assert proof.moe_witness is not None and proof.moe_witness.w == w
@@ -220,12 +368,14 @@ def test_moe_plain_peel_proof_verifies(per_expert, w, tile):
     # The proof binds the routing: the same tile under other tokens is rejected.
     wrong_rows = replace(opening, a_row_indices=tuple(expert_rows[i] for i in range(4)))
     with pytest.raises(ValueError, match="routed tokens"):
-        create_proof(wrong_rows, header)
+        create_proof(wrong_rows, header, PARENT_BYTES)
     # A dense opening cannot carry a witness, nor an MoE configuration omit it.
     with pytest.raises(ValueError, match="needs both"):
-        create_proof(replace(opening, moe=None), header)
+        create_proof(replace(opening, moe=None), header, PARENT_BYTES)
     with pytest.raises(ValueError, match="needs both"):
-        create_proof(replace(opening, mining_config=replace(config, experts=0)), header)
+        create_proof(
+            replace(opening, mining_config=replace(config, experts=0)), header, PARENT_BYTES
+        )
 
 
 def test_moe_opening_rejects_non_canonical_witnesses():
@@ -262,18 +412,22 @@ def test_moe_opening_rejects_non_canonical_witnesses():
     shifted[-1] -= 1  # no longer ends at len(routing)
     for bad_offsets in (tuple(shifted), tuple(reversed(offsets)), tuple(float(o) for o in offsets)):
         with pytest.raises((ValueError, TypeError)):
-            create_proof(replace(opening, moe=replace(moe, offsets=bad_offsets)), header)
+            create_proof(
+                replace(opening, moe=replace(moe, offsets=bad_offsets)), header, PARENT_BYTES
+            )
     with pytest.raises(TypeError, match="integers"):
-        create_proof(replace(opening, moe=replace(moe, expert_index=True)), header)
+        create_proof(replace(opening, moe=replace(moe, expert_index=True)), header, PARENT_BYTES)
     float_rows = tuple(float(r) for r in opening.a_row_indices)  # == the ints, but not ints
     with pytest.raises(TypeError, match="integers"):
-        create_proof(replace(opening, a_row_indices=float_rows), header)
+        create_proof(replace(opening, a_row_indices=float_rows), header, PARENT_BYTES)
     bool_inner = (False, *moe.inner_a_rows[1:])  # == 0, but not an int
     with pytest.raises(TypeError, match="integers"):
-        create_proof(replace(opening, moe=replace(moe, inner_a_rows=bool_inner)), header)
+        create_proof(
+            replace(opening, moe=replace(moe, inner_a_rows=bool_inner)), header, PARENT_BYTES
+        )
     float_cols = tuple(float(c) for c in opening.b_column_indices)
     with pytest.raises(TypeError, match="integers"):
-        create_proof(replace(opening, b_column_indices=float_cols), header)
+        create_proof(replace(opening, b_column_indices=float_cols), header, PARENT_BYTES)
     # Expert 0's first column tile starts at 0, 1: bools there survive the
     # expert-base subtraction as ints, so the given values must be checked.
     moe0 = replace(moe, expert_index=0, inner_a_rows=tuple(_tile_indices(config.rows_pattern, 0)))
@@ -286,12 +440,14 @@ def test_moe_opening_rejects_non_canonical_witnesses():
         b_column_indices=cols0,
     )
     assert cols0[:2] == (0, 1)
-    create_proof(opening0, header)  # the int form is a valid opening
+    create_proof(opening0, header, PARENT_BYTES)  # the int form is a valid opening
     with pytest.raises(TypeError, match="integers"):
-        create_proof(replace(opening0, b_column_indices=(False, True, *cols0[2:])), header)
+        create_proof(
+            replace(opening0, b_column_indices=(False, True, *cols0[2:])), header, PARENT_BYTES
+        )
     # Columns outside the winning expert's stacked rows are not its tile.
     with pytest.raises(ValueError, match="b_column_indices"):
-        create_proof(replace(opening, b_column_indices=cols0), header)
+        create_proof(replace(opening, b_column_indices=cols0), header, PARENT_BYTES)
 
     # Canonical routing lists every expert's tokens strictly ascending: a
     # swapped pair or a duplicate anywhere in the table (even in another
@@ -302,7 +458,9 @@ def test_moe_opening_rejects_non_canonical_witnesses():
     duplicated[offsets[0]] = duplicated[offsets[0] + 1]
     for bad_routing in (tuple(swapped), tuple(duplicated)):
         with pytest.raises(ValueError, match="strictly increasing"):
-            create_proof(replace(opening, moe=replace(moe, routing=bad_routing)), header)
+            create_proof(
+                replace(opening, moe=replace(moe, routing=bad_routing)), header, PARENT_BYTES
+            )
 
 
 def test_owned_copy_snapshots_the_moe_witness():
@@ -338,7 +496,7 @@ def test_owned_copy_snapshots_the_moe_witness():
     offsets[-1] -= 1
     inner[0] += 1
     header = make_plain_peel_header(nbits=ALWAYS_WIN_NBITS)
-    proof = create_proof(owned, header)
+    proof = create_proof(owned, header, PARENT_BYTES)
     accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, header, proof)
     assert accepted, message
 
@@ -375,7 +533,7 @@ def test_opening_validation_rejects_malformed_planes(field, replacement, message
     malformed = replace(opening, **{field: replacement(getattr(opening, field))})
 
     with pytest.raises(ValueError, match=message):
-        create_proof(malformed, make_plain_peel_header())
+        create_proof(malformed, make_plain_peel_header(), PARENT_BYTES)
 
 
 def test_opening_validation_rejects_non_integer_indices():
@@ -383,13 +541,16 @@ def test_opening_validation_rejects_non_integer_indices():
     malformed = replace(opening, a_row_indices=("0", *opening.a_row_indices[1:]))
 
     with pytest.raises(TypeError, match="must contain integers"):
-        create_proof(malformed, make_plain_peel_header())
+        create_proof(malformed, make_plain_peel_header(), PARENT_BYTES)
 
 
 def test_owned_copy_detaches_mutable_plane_storage():
-    opening = _opening()
+    ancestor = bytearray(PARENT_BYTES)
+    opening = replace(_opening(), b_ancestor_header=ancestor)
     owned = opening.owned_copy()
 
+    ancestor[0] ^= 1
+    assert owned.b_ancestor_header == PARENT_BYTES
     opening.a_codes.fill_(7)
     opening.a_scales.fill_(3)
     opening.b_codes.fill_(5)
@@ -409,7 +570,7 @@ def test_owned_copy_detaches_mutable_plane_storage():
 def test_owned_copy_reuses_b_planes_when_the_opening_tree_is_prebuilt():
     opening = _opening()
     header = make_plain_peel_header()
-    _, key_b = commitment_keys(bytes(header.to_bytes()))
+    _, key_b = commitment_keys(bytes(header.to_bytes()), PARENT_BYTES)
     commitment = commit_planes(
         [opening.b_codes, opening.b_scales], key_b, opening.mining_config.b_hash_id
     )
@@ -425,13 +586,16 @@ def test_owned_copy_reuses_b_planes_when_the_opening_tree_is_prebuilt():
     assert owned.b_codes is opening.b_codes
     assert owned.b_scales is opening.b_scales
     assert owned.b_commitment is opening.b_commitment
-    assert create_proof(owned, header).to_base64() == create_proof(opening, header).to_base64()
+    assert (
+        create_proof(owned, header, PARENT_BYTES).to_base64()
+        == create_proof(opening, header, PARENT_BYTES).to_base64()
+    )
 
 
 def test_prebuilt_a_commitment_is_reused_without_rehashing_or_recloning():
     opening = _opening()
     header = make_plain_peel_header()
-    key_a, key_b = commitment_keys(bytes(header.to_bytes()))
+    key_a, key_b = commitment_keys(bytes(header.to_bytes()), PARENT_BYTES)
     comm_a = commit_planes(
         [opening.a_codes, opening.a_scales], key_a, opening.mining_config.a_hash_id
     )
@@ -453,14 +617,14 @@ def test_prebuilt_a_commitment_is_reused_without_rehashing_or_recloning():
         "miner_base.block_submission.commit_planes",
         side_effect=AssertionError("prebuilt operand was committed twice"),
     ):
-        proof = create_proof(owned, header)
+        proof = create_proof(owned, header, PARENT_BYTES)
     assert proof is not None
 
 
 def test_prebuilt_a_commitment_rejects_wrong_job_and_shape():
     opening = _opening()
     header = make_plain_peel_header()
-    key_a, _ = commitment_keys(bytes(header.to_bytes()))
+    key_a, _ = commitment_keys(bytes(header.to_bytes()), PARENT_BYTES)
     commitment = commit_planes(
         [opening.a_codes, opening.a_scales], key_a, opening.mining_config.a_hash_id
     )
@@ -470,7 +634,7 @@ def test_prebuilt_a_commitment_rejects_wrong_job_and_shape():
         a_commitment=PrebuiltCommitment(commitment, b"wrong"),
     )
     with pytest.raises(ValueError, match="another job"):
-        create_proof(wrong_job, header)
+        create_proof(wrong_job, header, PARENT_BYTES)
 
     wrong_shape = replace(
         opening,
@@ -479,7 +643,7 @@ def test_prebuilt_a_commitment_rejects_wrong_job_and_shape():
         a_commitment=PrebuiltCommitment(commitment, key_a),
     )
     with pytest.raises(ValueError, match="covers"):
-        create_proof(wrong_shape, header)
+        create_proof(wrong_shape, header, PARENT_BYTES)
 
 
 def _plain_job() -> MiningJob:
@@ -487,7 +651,38 @@ def _plain_job() -> MiningJob:
         incomplete_header_bytes=bytes(make_plain_peel_header().to_bytes()),
         target=1,
         cert_version=CertificateVersion.PLAIN_FP8,
+        ancestor_headers=[PARENT_BYTES],
     )
+
+
+def test_submission_requires_the_parent_header():
+    client = Mock()
+
+    with pytest.raises(ValueError, match="no ancestor headers"):
+        submit_opened_block(_opening(), replace(_plain_job(), ancestor_headers=[]), client)
+    client.submit_plain_proof.assert_not_called()
+
+
+@pytest.mark.parametrize("depth", range(1, 5))
+def test_submission_resolves_the_selected_b_ancestor(depth):
+    header, expected = _historical_plain_proof(depth)
+    job = MiningJob(
+        bytes(header.to_bytes()),
+        (1 << 256) - 1,
+        CertificateVersion.PLAIN_FP8,
+        [bytes(h.to_bytes()) for h in expected.ancestor_chain] + [PARENT_BYTES],
+    )
+    opening = replace(_opening(), b_ancestor_header=PARENT_BYTES)
+    client = Mock()
+    proof = submit_opened_block(opening, job, client)
+    assert bytes(proof.to_bytes()) == bytes(expected.to_bytes())
+    client.submit_plain_proof.assert_called_once_with(proof, job)
+    client.reset_mock()
+    with pytest.raises(ValueError, match="outside.*state window"):
+        submit_opened_block(
+            opening, replace(job, ancestor_headers=job.ancestor_headers[:-1]), client
+        )
+    client.submit_plain_proof.assert_not_called()
 
 
 def test_submission_rejects_non_fp8_job_before_gateway_handoff():
@@ -510,9 +705,10 @@ def test_real_policy_inadmissibility_sentinel_is_filtered():
         incomplete_header_bytes=bytes(header.to_bytes()),
         target=(1 << 256) - 1,
         cert_version=CertificateVersion.PLAIN_FP8,
+        ancestor_headers=[PARENT_BYTES],
     )
     opening = _opening(policy_inadmissible=True)
-    proof = create_proof(opening, header)
+    proof = create_proof(opening, header, PARENT_BYTES)
 
     accepted, message = verify_plain_proof_for_cert_version(CERT_VERSION_PLAIN_FP8, header, proof)
     assert (accepted, message) == (False, "The jackpot is not admissible")
